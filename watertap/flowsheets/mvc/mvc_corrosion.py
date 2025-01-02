@@ -16,6 +16,8 @@ from pyomo.environ import (
     Constraint,
     Objective,
     Var,
+    Expression,
+    Set,
     TransformationFactory,
     units as pyunits,
     check_optimal_termination,
@@ -24,6 +26,7 @@ from pyomo.environ import (
 from pyomo.network import Arc, SequentialDecomposition
 
 import pyomo.environ as pyo
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
 from idaes.core import FlowsheetBlock
 from watertap.core.solvers import get_solver
 from idaes.core.util.model_statistics import degrees_of_freedom
@@ -38,8 +41,8 @@ from idaes.models.unit_models.heat_exchanger import (
 )
 from idaes.core import UnitModelCostingBlock
 import idaes.core.util.scaling as iscale
-
-
+from idaes.core.surrogate.pysmo_surrogate import PysmoSurrogate
+from idaes.core.surrogate.surrogate_block import SurrogateBlock
 
 from watertap.unit_models.mvc.components import Evaporator, Compressor, Condenser
 from watertap.unit_models.mvc.components.lmtd_chen_callback import (
@@ -50,11 +53,13 @@ import watertap.property_models.seawater_prop_pack as props_sw
 import watertap.property_models.water_prop_pack as props_w
 from watertap.costing import WaterTAPCosting
 import math
+import numpy as np
+import pandas as pd
 
-
-def main():
+def single_run(material='stainless_steel_316',
+         do=0):
     # build, set operating conditions, initialize for simulation
-    m = build()
+    m = build(material=material)
     set_operating_conditions(m)
     add_Q_ext(m, time_point=m.fs.config.time)
     initialize_system(m)
@@ -75,7 +80,10 @@ def main():
     display_metrics(m)
     display_design(m)
 
-    print("\n***---Second solve - optimization results---***")
+    print("\n***---Second solve - optimization with corrosion rate surrogate---***")
+    add_evap_hx_material_factor_equal_constraint(m)
+    add_corrosion_rate_surrogate(m)
+    set_surrogate_conditions(m,do)
     m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
     del m.fs.objective
     set_up_optimization(m)
@@ -83,14 +91,22 @@ def main():
     print("Termination condition: ", results.solver.termination_condition)
     display_metrics(m)
     display_design(m)
+    display_corrosion(m)
 
-    m.fs.visualize("My Flowsheet", save_as="my_flowsheet.json")
+    print("\n***---Third solve - optimization with increased brine temperature upper bound---***")
+    m.fs.evaporator.properties_vapor[0].temperature.setub(95 + 273.15)
+    results = solve(m, solver=solver, tee=False)
+    print("Termination condition: ", results.solver.termination_condition)
+    display_metrics(m)
+    display_design(m)
+    display_corrosion(m)
     return m, results
 
 
-def build():
+def build(material):
     # flowsheet set up
     m = ConcreteModel()
+    m.material = material
     m.fs = FlowsheetBlock(dynamic=False)
 
     # Properties
@@ -310,6 +326,106 @@ def build():
     return m
 
 
+def add_corrosion_rate_surrogate(m):
+    # surrogate_dir = f"C:/Users/Carson/idaes/oli-watertap/corrosion_example/surrogate_models/{m.material}/"
+
+    surrogate_dir = f"C:/Users/runak/Documents/Stanford/WE3/WaterTAP/watertap/watertap/flowsheets/mvc/Corrosion_surrogates/stainless_steel_316/"
+
+
+    # 1. Add indexed version of inputs: temperature, brine salinity, dissolved oxygen
+    m.fs.temperature_indexed = Var(
+        [0],
+        initialize=m.fs.evaporator.properties_brine[0].temperature.value,
+        # bounds=(293, 400),
+        units=pyunits.dimensionless
+    )
+    m.fs.eq_temperature_indexed = Constraint(
+        expr=m.fs.evaporator.properties_brine[0].temperature == m.fs.temperature_indexed[0] + 273.15
+    )
+
+    brine_salt = m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq','TDS'].value
+    brine_water = m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq','H2O'].value
+    m.fs.brine_salinity_indexed = Var(
+        [0],
+        initialize=brine_salt/(brine_water + brine_salt),
+        units=pyunits.dimensionless
+    )
+    m.fs.eq_brine_salinity_indexed = Constraint(
+        expr=m.fs.evaporator.properties_brine[0].mass_frac_phase_comp['Liq','TDS'] == m.fs.brine_salinity_indexed[0]
+    )
+
+    m.fs.dissolved_oxygen_index = Var(
+        [0],
+        initialize=0,
+        units=pyunits.dimensionless
+    )
+    # 2. Add corrosion rate and potential difference outputs
+    m.fs.corrosion_rate_indexed = Var(
+        [0],
+        initialize=0.1,
+        units=pyunits.dimensionless
+    )
+    m.fs.corrosion_rate = Var(
+        initialize=0.1,
+        bounds=(0, 0.1), # cannot exceed 0.1
+        units=pyunits.m**-3 / pyunits.year
+    )
+    m.fs.eq_corrosion_rate_indexed = Constraint(
+        expr=m.fs.corrosion_rate==m.fs.corrosion_rate_indexed[0]
+    )
+
+    m.fs.potential_difference_indexed = Var(
+        [0],
+        initialize=0.0,
+        units=pyunits.dimensionless
+    )
+    m.fs.potential_difference = Var(
+        initialize=0,
+        bounds=(0,100),
+        units=pyunits.dimensionless
+    )
+    m.fs.eq_potential_difference_indexed = Constraint(
+        expr=m.fs.potential_difference == m.fs.potential_difference_indexed[0]
+    )
+    # 3. Add corrosion rate surrogate - input order:'Temperature', 'Brine salinity', 'Dissolved oxygen mgO2'
+    filename = surrogate_dir + "final_surrogate/corrosion_rate.json"
+    corrosion_rate_surrogate = PysmoSurrogate.load_from_file(filename)
+    m.fs.corrosion_rate_surrogate = SurrogateBlock(concrete=True)
+    m.fs.corrosion_rate_surrogate.build_model(corrosion_rate_surrogate,
+                                              input_vars=[m.fs.temperature_indexed[0],
+                                                          m.fs.brine_salinity_indexed[0],
+                                                          m.fs.dissolved_oxygen_index[0]],
+                                              output_vars=[m.fs.corrosion_rate_indexed[0]])
+    # check value
+    calculate_variable_from_constraint(m.fs.corrosion_rate_indexed[0], m.fs.corrosion_rate_surrogate.pysmo_constraint['Corrosion Rate'])
+
+    # 4. Add potential different surrogate
+    filename = surrogate_dir + "final_surrogate/potential_difference.json"
+    potential_difference_surrogate = PysmoSurrogate.load_from_file(filename)
+    m.fs.potential_difference_surrogate = SurrogateBlock(concrete=True)
+    m.fs.potential_difference_surrogate.build_model(potential_difference_surrogate,
+                                              input_vars=[m.fs.temperature_indexed[0],
+                                                          m.fs.brine_salinity_indexed[0],
+                                                          m.fs.dissolved_oxygen_index[0]],
+                                              output_vars=[m.fs.potential_difference_indexed[0]])
+    # check value
+    calculate_variable_from_constraint(m.fs.potential_difference_indexed[0], m.fs.potential_difference_surrogate.pysmo_constraint['Potential Difference'])
+
+def set_surrogate_conditions(m,do=0):
+    # fix dissolved oxygen
+    m.fs.dissolved_oxygen_index[0].fix(do)
+    # fix material factor corresponding to surrogate
+    material_factor = {
+        "carbon_steel_1018": 1,
+        "stainless_steel_304": 3.0,
+        "stainless_steel_316": 3.1,
+        "duplex_stainless_steel_2205": 3.4,
+        "duplex_stainless_steel_2507": 3.5,
+        "nickel_alloy_625": 3.9,
+        "nickel_alloy_825": 4
+    }
+    m.fs.costing.evaporator.material_factor_cost.fix(material_factor[m.material])
+
 def add_Q_ext(m, time_point=None):
     # Allows additional heat to be added to evaporator so that an initial feasible solution can be found as a starting
     # guess for optimization in case physically infeasible simulation is proposed
@@ -357,6 +473,86 @@ def add_costing(m):
     m.fs.costing.add_LCOW(m.fs.distillate.properties[0].flow_vol)
     m.fs.costing.add_specific_energy_consumption(m.fs.distillate.properties[0].flow_vol)
     m.fs.costing.base_currency = pyo.units.USD_2020
+
+    # Add costing expressions
+    m.fs.costing.MVC_components = Set(initialize=["feed_pump",
+                                                  "distillate_pump",
+                                                  "brine_pump",
+                                                  "hx_distillate",
+                                                  "hx_brine",
+                                                  "mixer",
+                                                  "evaporator",
+                                                  "compressor"])
+    # Percentage of capital costs
+    m.fs.costing.MVC_capital_cost_percentage = Expression(m.fs.costing.MVC_components)
+    m.fs.costing.MVC_capital_cost_percentage["feed_pump"] = (
+            m.fs.pump_feed.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["distillate_pump"] = (
+            m.fs.pump_distillate.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["brine_pump"] = (
+            m.fs.pump_brine.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["hx_distillate"] = (
+            m.fs.hx_distillate.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["hx_brine"] = (
+            m.fs.hx_brine.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["mixer"] = (
+            m.fs.mixer_feed.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["evaporator"] = (
+            m.fs.evaporator.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+    m.fs.costing.MVC_capital_cost_percentage["compressor"] = (
+            m.fs.compressor.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
+
+    # Percentage of costs normalized to LCOW
+    m.fs.costing.annual_operating_costs = Expression(
+        expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost)
+    m.fs.costing.MVC_LCOW_comp = Set(initialize=["feed_pump",
+                                                 "distillate_pump",
+                                                 "brine_pump",
+                                                 "hx_distillate",
+                                                 "hx_brine",
+                                                 "mixer",
+                                                 "evaporator",
+                                                 "compressor",
+                                                 "electricity",
+                                                 "MLC",
+                                                 "capital_costs",
+                                                 "operating_costs",
+                                                 "capex_opex_ratio"])
+    m.fs.costing.LCOW_percentage = Expression(m.fs.costing.MVC_LCOW_comp)
+    m.fs.costing.LCOW_percentage["feed_pump"] = (
+            m.fs.pump_feed.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["distillate_pump"] = (
+            m.fs.pump_distillate.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["brine_pump"] = (
+            m.fs.pump_brine.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["hx_distillate"] = (
+            m.fs.hx_distillate.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["hx_brine"] = (
+            m.fs.hx_brine.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["mixer"] = (
+            m.fs.mixer_feed.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["evaporator"] = (
+            m.fs.evaporator.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["compressor"] = (
+            m.fs.compressor.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage['electricity'] = (m.fs.costing.aggregate_flow_costs[
+                                                       'electricity'] * m.fs.costing.utilization_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage['MLC'] = (
+            m.fs.costing.maintenance_labor_chemical_operating_cost / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["capital_costs"] = (
+            m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage["operating_costs"] = (
+            m.fs.costing.total_operating_cost / m.fs.costing.annual_operating_costs)
+    m.fs.costing.LCOW_percentage['capex_opex_ratio'] = (
+            m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor / m.fs.costing.total_operating_cost)
+
+
+def add_evap_hx_material_factor_equal_constraint(m):
+    m.fs.costing.heat_exchanger.material_factor_cost.unfix()
+    # make HX material factor equal to evaporator material factor
+    m.fs.costing.hx_material_factor_constraint = Constraint(
+        expr=m.fs.costing.heat_exchanger.material_factor_cost == m.fs.costing.evaporator.material_factor_cost)
+    # m.fs.costing.heat_exchanger.material_factor_cost = m.fs.costing.evaporator.material_factor_cost.value
 
 
 def set_operating_conditions(m):
@@ -746,7 +942,202 @@ def display_design(m):
     print(
         "Evaporator LMTD:                          %.2f K" % m.fs.evaporator.lmtd.value
     )
+    print(
+        "Evaporator material factor:               %.2f " % m.fs.costing.evaporator.material_factor_cost.value
+    )
 
+def display_corrosion(m):
+    print('\nCorrosion results')
+    print(f'Material:                        {m.material}')
+    print(
+        "Corrosion rate:                     %.2f mm/yr"
+        % m.fs.corrosion_rate.value
+    )
+    print(
+        "Potential difference:                     %.2f V"
+        % m.fs.potential_difference.value
+    )
+
+def feed_salinity_recovery_sweep(material='stainless_steel_316',
+                                 do=0):
+    save_dir = "C:/Users/Carson/idaes/NAWI-analysis/analysis_waterTAP/analysisWaterTAP/analysis_scripts/mvc_corrosion/results"
+    filename = save_dir + f"/{material}_{do}_feed_recovery.csv"
+
+    # # build model
+    # m = mvc_setup.build(material=material)
+    # print("\ninitialization")
+    # mvc_setup.initialize(m, do=do)
+    # print("\ninitial optimizing")
+    m = build(material=material)
+    set_operating_conditions(m)
+    add_Q_ext(m, time_point=m.fs.config.time)
+    initialize_system(m)
+    # rescale costs after initialization because scaling depends on flow rates
+    scale_costs(m)
+    fix_outlet_pressures(m)  # outlet pressure are initially unfixed for initialization
+
+    # set up for minimizing Q_ext in first solve
+    # should be 1 DOF because Q_ext is unfixed
+    # print("DOF after initialization: ", degrees_of_freedom(m))
+    m.fs.objective = Objective(expr=m.fs.Q_ext[0])
+
+    print("\n***---First solve - simulation results---***")
+    solver = get_solver()
+    results = solve(m, solver=solver, tee=False)
+    print("Termination condition: ", results.solver.termination_condition)
+    display_metrics(m)
+    display_design(m)
+
+    print("\n***---Second solve - optimization with corrosion rate surrogate---***")
+    add_evap_hx_material_factor_equal_constraint(m)
+    add_corrosion_rate_surrogate(m)
+    set_surrogate_conditions(m, do=do)
+    m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
+    del m.fs.objective
+    set_up_optimization(m)
+    results = solve(m, solver=solver, tee=False)
+    print("Termination condition: ", results.solver.termination_condition)
+    display_metrics(m)
+    display_design(m)
+    display_corrosion(m)
+
+    print('\n---------\nInitialization DONE\n---------')
+    salinity_recovery_dict = {}
+    salinity_recovery_dict[25] = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
+    salinity_recovery_dict[50] = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
+    salinity_recovery_dict[75] = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7]
+    salinity_recovery_dict[100] = [0.4, 0.45, 0.5, 0.55, 0.6]
+    salinity_recovery_dict[125] = [0.4, 0.45, 0.5]
+    salinity_recovery_dict[150] = [0.4, 0.45, 0.5]
+
+    results_dict = build_results_dict()
+    for sal, rec in salinity_recovery_dict.items():
+        # start at first recovery
+        m.fs.recovery[0].fix(rec[0])
+        results = solve(m)
+        # print('First recovery termination condition: ', results.solver.termination_condition)
+        # now update salinity
+        m.fs.feed.properties[0].mass_frac_phase_comp["Liq", "TDS"].fix(sal/1000)
+        results = solve(m)
+        print('Next salinity termination condition:', results.solver.termination_condition)
+        for r in rec:
+            m.fs.recovery[0].fix(r)
+            try:
+                results = solve(m)
+                results_dict['Termination condition'].append(results.solver.termination_condition)
+                update_results_dict(m, results_dict)
+            except:
+                results_dict['Feed salinity'].append(sal)
+                results_dict['Recovery'].append(r)
+                results_dict['Material'].append(material)
+                results_dict['Termination condition'].append('bad status')
+                update_results_dict_error(results_dict)
+
+        # temporarily save results
+        results_df = pd.DataFrame(results_dict)
+        results_df.to_csv(filename, index=False)
+
+    # save results as dataframe
+    results_df = pd.DataFrame(results_dict)
+    results_df.to_csv(filename, index=False)
+    print(f'Saved {material} and {do} dissolved oxygen')
+
+    return
+
+def build_results_dict():
+    res_dict = {}
+    res_dict['Feed salinity'] = []
+    res_dict['Recovery'] = []
+    res_dict['Material'] = []
+    res_dict['Evaporator temperature'] = []
+    res_dict['Feed flow rate'] = []
+    res_dict['Brine salinity'] = []
+    res_dict['Product flow rate'] = []
+    res_dict['SEC'] = []
+    res_dict['LCOW'] = []
+    res_dict['External Q'] = []
+    res_dict['Preheated feed temperature'] = []
+    res_dict['Evaporator vapor pressure'] = []
+    res_dict['Compressed vapor temperature'] = []
+    res_dict['Compressed vapor pressure'] = []
+    res_dict['Condensed vapor temperature'] = []
+    res_dict['Compressor pressure ratio'] = []
+    res_dict['Evaporator area'] = []
+    res_dict['Evaporator LMTD'] = []
+    res_dict['Evaporator material factor'] = []
+    res_dict['Corrosion rate'] = []
+    res_dict['Potential difference'] = []
+    res_dict['Dissolved oxygen']= []
+    res_dict['capex_opex_ratio'] = []
+    res_dict['Termination condition'] = []
+
+    return res_dict
+
+def update_results_dict(m, res_dict):
+    res_dict['Feed salinity'].append(m.fs.feed.properties[0].mass_frac_phase_comp["Liq", "TDS"].value*1000)
+    res_dict['Recovery'].append(m.fs.recovery[0].value)
+    res_dict['Material'].append(m.material)
+    res_dict['Evaporator temperature'].append(m.fs.evaporator.properties_brine[0].temperature.value)
+    res_dict['Feed flow rate'].append(m.fs.feed.properties[0].flow_mass_phase_comp["Liq", "H2O"].value +
+                                      m.fs.feed.properties[0].flow_mass_phase_comp["Liq", "TDS"].value)
+    res_dict['Brine salinity'].append(m.fs.evaporator.properties_brine[0].mass_frac_phase_comp["Liq", "TDS"].value * 1e3)
+    res_dict['Product flow rate'].append(m.fs.evaporator.properties_vapor[0].flow_mass_phase_comp["Vap", "H2O"].value)
+    res_dict['SEC'].append(value(m.fs.costing.specific_energy_consumption))
+    res_dict['LCOW'].append(value(m.fs.costing.LCOW))
+    res_dict['External Q'].append(value(m.fs.Q_ext[0]))
+    res_dict['Preheated feed temperature'].append(m.fs.evaporator.properties_feed[0].temperature.value)
+    res_dict['Evaporator vapor pressure'].append(m.fs.evaporator.properties_vapor[0].pressure.value)
+    res_dict['Compressed vapor temperature'].append(m.fs.compressor.control_volume.properties_out[0].temperature.value)
+    res_dict['Compressed vapor pressure'].append(m.fs.compressor.control_volume.properties_out[0].pressure.value)
+    res_dict['Condensed vapor temperature'].append(m.fs.condenser.control_volume.properties_out[0].temperature.value)
+    res_dict['Compressor pressure ratio'].append(m.fs.compressor.pressure_ratio.value)
+    res_dict['Evaporator area'].append(m.fs.evaporator.area.value)
+    res_dict['Evaporator LMTD'].append(m.fs.evaporator.lmtd.value)
+    res_dict['Evaporator material factor'].append(m.fs.costing.evaporator.material_factor_cost.value)
+    res_dict['Corrosion rate'].append(m.fs.corrosion_rate.value)
+    res_dict['Potential difference'].append(m.fs.potential_difference.value)
+    res_dict['Dissolved oxygen'].append(m.fs.dissolved_oxygen_index[0].value)
+    res_dict['capex_opex_ratio'].append(value(m.fs.costing.LCOW_percentage['capex_opex_ratio']))
+
+    return res_dict
+
+def update_results_dict_error(res_dict):
+    res_dict['Evaporator temperature'].append(np.NAN)
+    res_dict['Feed flow rate'].append(np.NAN)
+    res_dict['Brine salinity'].append(np.NAN)
+    res_dict['Product flow rate'].append(np.NAN)
+    res_dict['SEC'].append(np.NAN)
+    res_dict['LCOW'].append(np.NAN)
+    res_dict['External Q'].append(np.NAN)
+    res_dict['Preheated feed temperature'].append(np.NAN)
+    res_dict['Evaporator vapor pressure'].append(np.NAN)
+    res_dict['Compressed vapor temperature'].append(np.NAN)
+    res_dict['Compressed vapor pressure'].append(np.NAN)
+    res_dict['Condensed vapor temperature'].append(np.NAN)
+    res_dict['Compressor pressure ratio'].append(np.NAN)
+    res_dict['Evaporator area'].append(np.NAN)
+    res_dict['Evaporator LMTD'].append(np.NAN)
+    res_dict['Evaporator material factor'].append(np.NAN)
+    res_dict['Corrosion rate'].append(np.NAN)
+    res_dict['Potential difference'].append(np.NAN)
+    res_dict['Dissolved oxygen'].append(np.NAN)
+    res_dict['capex_opex_ratio'].append(np.NAN)
+
+    return res_dict
 
 if __name__ == "__main__":
-    m = main()
+    # m = main()
+    assert False
+    mat_list = [  # 'carbon_steel_1018',
+        # 'stainless_steel_304',
+        'stainless_steel_316',
+        # 'duplex_stainless_steel_2205',
+        # 'duplex_stainless_steel_2507',
+        # 'nickel_alloy_625',
+        # 'nickel_alloy_825'
+        ]
+    do_list = [0, 3.5, 7]
+    single_run(material='duplex_stainless_steel_2205', do=3.5)
+    # for mat in mat_list:
+    #     for do in do_list:
+    #         feed_salinity_recovery_sweep(mat, do)
