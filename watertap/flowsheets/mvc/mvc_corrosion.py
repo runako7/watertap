@@ -127,9 +127,7 @@ def build(material):
     # Properties
     m.fs.properties_feed = props_sw.SeawaterParameterBlock()
     m.fs.properties_vapor = props_w.WaterParameterBlock()
-    print("Properties Feed attributes:", dir(m.fs.properties_feed))
-    print("Properties Vapor attributes:", dir(m.fs.properties_vapor))
-    # print("TDS in feed:", m.fs.properties_feed.TDS.value)
+
 
     # Unit models
     m.fs.feed = Feed(property_package=m.fs.properties_feed)
@@ -585,33 +583,23 @@ def add_scaling_tendencies(m, open_species=False):
     }
     sea_water_pH = 7.56
 
-    # fix temperature, pressure and pH of feed
-    """temperature"""
-    m.fs.feed.temperature = Var(initialize=293, bounds=(0, 300), units=pyunits.K)
-    m.fs.feed.temperature.fix()
-    set_scaling_factor(m.fs.feed.temperature, 1 / 293)
-    """pressure"""
-    m.fs.feed.pressure = Var(initialize=1e5, units=pyunits.Pa)
-    m.fs.feed.pressure.fix()
-    set_scaling_factor(m.fs.feed.pressure, 1 / 1e5)
+    # fix temperature, pressure and pH of raw feed (raw --> no acid addition)
+
     """pH"""
     m.fs.feed.pH = Var(initialize=sea_water_pH)
     m.fs.feed.pH.fix()
     set_scaling_factor(m.fs.feed.pH, 1)
 
-    # initialize ion concentrations in feed (no acid addition) and brine
+    # initialize ion concentrations in raw feed
     ions = list(sea_water_composition.keys())
     m.fs.feed.species_concentrations = Var(
         ions,
         initialize=1,
         units=pyunits.mg / pyunits.L,
     )
-    m.fs.brine.species_concentrations = Var(
-        ions,
-        initialize=1,
-        units=pyunits.mg / pyunits.L,
 
-    # initialize mass flow of all the species in the feed and brine, including water
+
+    # initialize mass flow of all the species in the raw feed, including water
     ions.append("H2O")
     m.fs.feed.species_mass_flows = Var(
         ions,
@@ -619,26 +607,18 @@ def add_scaling_tendencies(m, open_species=False):
         units=pyunits.kg/pyunits.s
     )
 
-    m.fs.brine.species_mass_flows = Var(
-        ions,
-        initialize=1,
-        units=pyunits.kg / pyunits.s
-    )
-
-    # initialize charge neutrality in the feed
+    # initialize charge neutrality in the raw feed
     m.fs.feed.charge = Var(initialize=0)
     set_scaling_factor(m.fs.feed.charge, 1e8)
 
-
-    # initialize feed density
+    # initialize density of raw feed
     m.fs.feed.density = Var(initialize=1000, units=pyunits.kg / pyunits.m**3)
     set_scaling_factor(m.fs.feed.density, 1e-3)
 
 
-    # build constraint for species concentrations in feed with no acid addition
+    # build constraint for species concentrations in raw feed with no acid addition
 
-
-    m.fs.eq_TDS_constraint = Constraint(
+    m.fs.eq_feed_TDS_constraint = Constraint(
         expr = m.fs.feed.properties[0].flow_mass_phase_comp["Liq", "TDS"] == sum(
             m.fs.feed.species_mass_flows[ion]
             for ion in ions
@@ -647,7 +627,7 @@ def add_scaling_tendencies(m, open_species=False):
     )
     # not sure of the units of flow_mass_phase_comp["Liq", "TDS"]
 
-    # constraint to convert concentration to mass flows
+    # build constraint to convert raw feed concentrations to mass flows
 
     @m.fs.feed.Constraint(list(m.fs.feed.species_concentrations.keys()))
     def eq_feed_species_mass_flows(fs, ion):
@@ -659,36 +639,49 @@ def add_scaling_tendencies(m, open_species=False):
             to_units=pyunits.kg / pyunits.s,
         )
 
+    # initialize evaporator feed mass flows based on raw feed mass flows (both salts and water)
 
-    # Add constraints to brine mass flows for both TDS and water
-    @m.fs.brine.Constraint(list(m.fs.brine.species_concentrations.keys()))
-    def eq_brine_species_mass_flows(fs,ion):
-        return m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq', 'TDS'].value == sum(
-            m.fs.brine.species_mass_flows[ion]
+    m.fs.evaporator.properties_feed[0].flow_mass_phase_comp['Liq', 'TDS'] = sum(
+            m.fs.feed.species_mass_flows[ion]
             for ion in ions
             if ion != "H2O"
+
+    m.fs.evaporator.properties_feed[0].flow_mass_phase_comp["Liq", "H20"] = m.fs.feed.species_mass_flows["H20"]
+
+    # Add constraint to evaporator feed and brine mass flows (both salts and water)
+
+    m.fs.eq_evaporator_brine_salts_mass_flows = Constraint(
+        expr = m.fs.evaporator.properties_brine[0].flow_mass_phase_comp["Liq", "TDS"] == m.fs.evaporator.properties_feed[0].flow_mass_phase_comp["Liq", "TDS"]
+    )
+
+    m.fs.eq_evaporator_brine_water_mass_flow = Constraint(
+        expr = m.fs.evaporator.properties_brine[0].flow_mass_phase_comp["Liq", "H2O"] == (
+            m.fs.evaporator.properties_feed[0].flow_mass_phase_comp["Liq", "H2O"]
+            - m.fs.evaporator.properties_vapor[0].flow_mass_phase_comp["Vap", "H2O"]
         )
+    )
 
-     m.fs.eq_brine_water_mass_flow = Constraint(
-         expr = m.fs.brine.species_mass_flows["H20"] == m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq', 'H2O'].value)
-     )
+    # initialize pH, density, charge, and species mass flows of evaporator brine
+    m.fs.evaporator.properties_brine[0].pH = m.fs.feed.pH
+    m.fs.evaporator.properties_brine[0].density = m.fs.feed.density
+    m.fs.evaporator.properties_brine[0].charge = m.fs.feed.charge
+    m.fs.evaporator.properties_brine[0].species_mass_flows = m.fs.feed.species_mass_flows
 
-    # build reaktoro output dictionary to get the scaling tendency of the brine
-    m.fs.brine.scaling_tendencies = Var(
+    # build reaktoro output dictionary to get the scaling tendency of the evaporator brine
+    m.fs.evaporator.properties_brine[0].scaling_tendencies = Var(
         [
             ("scalingTendency", "Calcite"),
         ],
         initialize=1,
     )
 
-
-    m.fs.brine.reaktoro_output_properties = {}
-    for key, obj in  m.fs.brine.scaling_tendencies.items():
-        m.fs.brine.reaktoro_output_properties[key] = obj
-    m.fs.brine.reaktoro_output_properties[("pH", None)] = m.fs.feed.pH
-    m.fs.brine.reaktoro_output_properties[("density", None)] = m.fs.feed.density
-    m.fs.brine.reaktoro_output_properties[("charge", None)] = m.fs.feed.charge
-    m.fs.brine.reaktoro_output_properties["speciesAmount"] = True
+    m.fs.evaporator.properties_brine[0].reaktoro_output_properties = {}
+    for key, obj in  m.fs.evaporator.properties_brine[0].scaling_tendencies.items():
+        m.fs.evaporator.properties_brine[0].reaktoro_output_properties[key] = obj
+    m.fs.evaporator.properties_brine[0].reaktoro_output_properties[("pH", None)] = m.fs.evaporator.properties_brine[0].pH
+    m.fs.evaporator.properties_brine[0].reaktoro_output_properties[("density", None)] = m.fs.evaporator.properties_brine[0].density
+    m.fs.evaporator.properties_brine[0].reaktoro_output_properties[("charge", None)] = m.fs.evaporator.properties_brine[0].charge
+    m.fs.evaporator.properties_brine[0].reaktoro_output_properties["speciesAmount"] = True
 
 
     if open_species:
@@ -707,113 +700,113 @@ def add_scaling_tendencies(m, open_species=False):
 
     # configure reaktoro block
 
-    m.fs.brine.eq_reaktoro_properties = ReaktoroBlock(
+    m.fs.evaporator.properties_brine[0].eq_reaktoro_properties = ReaktoroBlock(
         system_state={
-            "temperature":m.fs.brine.temperature,
-            "pressure":m.fs.brine.properties[0].pressure,
-            "pH": m.fs.brine.pH,
+            "temperature":m.fs.evaporator.properties_brine[0].temperature,
+            "pressure":m.fs.evaporator.properties_brine[0].pressure,
+            "pH": m.fs.evaporator.properties_brine[0].pH,
         },
         aqueous_phase={
-            "composition":m.fs.brine.species_mass_flows, # should be based on brine in the evaporator
+            "composition":m.fs.evaporator.properties_brine[0].species_mass_flows, # should be based on brine in the evaporator
             "convert_to_rkt_species": True,
             # We can use default converter as its defined for default database (Phreeqc and pitzer)
             "activity_model": reaktoro.ActivityModelPitzer(),  # Can provide a string, or Reaktoro initialized class
             "fixed_solvent_specie": "H2O",  # We need to define our aqueous solvent as we have to speciate the block
         },
-        outputs=m.fs.brine.reaktoro_output_properties,# outputs we desired
+        outputs=m.fs.evaporator.properties_brine[0].reaktoro_output_properties,# outputs we desired
         database="PhreeqcDatabase",  # can also be reaktoro.PhreeqcDatabase('pitzer.dat')
         database_file="pitzer.dat",  # needs to be a string that names the database file or points to its location
         dissolve_species_in_reaktoro=True,  # This will sum up all species into elements in Reaktoro directly, if set to false, it will build Pyomo constraints instead
         assert_charge_neutrality=False,  # This is True by Default, but here we actually want to adjust the input speciation till the charge is zero
     )
 
-    # inspect the inputs and outputs of the reaktoro graybox model
-    m.fs.brine.eq_reaktoro_properties.reaktoro_model.inputs.display()
-
-    conversion_dict = m.fs.brine.eq_reaktoro_properties.rkt_inputs.constraint_dict
-    for element, species in conversion_dict.items():
-        print(element, species)
-
-    m.fs.brine.eq_reaktoro_properties.reaktoro_model.outputs.display()
-
-    # initialize reaktoro model
-
-    for ion, value in sea_water_composition.items(): #define a dictionary for brine
-        """Fix concentration amount"""
-        m.fs.brine.species_concentrations[ion].fix(value) # this is wrong. This needs to be composition in the brine
-        set_scaling_factor(m.fs.brine.species_concentrations[ion], 1 / value)
-
-    """Set flow to 1 kg of water"""
-    m.fs.brine.species_mass_flows["H2O"].fix(1)
-
-    """Initialize concentration constraints """
-    for comp, pyoobj in m.fs.brine.eq_brine_species_mass_flows.items():
-        if "H2O" in comp:
-            set_scaling_factor(m.fs.brine.species_mass_flows[ion], 1)
-        else:
-            calculate_variable_from_constraint(
-                m.fs.brine.species_mass_flows[comp], pyoobj
-            )
-            set_scaling_factor(
-                m.fs.brine.species_mass_flows[ion],
-                1 / m.fs.brine.species_mass_flows[comp].value,
-            )
-            constraint_scaling_transform(
-                pyoobj, 1 / m.fs.brine.species_mass_flow[comp].value
-            )
-
-    m.fs.sea_water.eq_reaktoro_properties.initialize()
-
-    print("Density:",m.fs.brine.density.value)
-
-    print("Solution charge:", m.fs.brine.charge.value)
-
-    m.fs.brine.eq_reaktoro_properties.display_reaktoro_state()
-
-
-    # Solve model
-
-    """Unfix Cl and fix charge to 0"""
-
-    m.fs.brine.species_concentrations["Cl"].unfix()
-    m.fs.brine.charge.fix(0)
-
-    # Check DOF
-
-    print("DOFs:", degrees_of_freedom(m))
-    outputs_main_block = len(m.fs.brine.eq_reaktoro_properties.reaktoro_model.outputs)
-    print("Number of Reaktoro outputs", outputs_main_block)
-    print(
-        "Actual DOFs:",
-        degrees_of_freedom(m) - (outputs_main_block),
-    )
-    assert degrees_of_freedom(m) - (outputs_main_block) == 0
-
-    initial_cl = m.fs.brine.species_concentrations["Cl"].value
-    cy_solver = get_solver(solver="cyipopt-watertap")
-
-    cy_solver.options["max_iter"] = 25
-
-    result = cy_solver.solve(m, tee=True)
-    assert_optimal_termination(result)
-
-    print(
-        "Density",
-        m.fs.brine.density.value,
-    )
-
-    print(
-        "Solution charge",
-        m.fs.brine.charge.value,
-        "Intial Cl",
-        initial_cl,
-        "Final Cl",
-        m.fs.brine.species_concentrations["Cl"].value,
-    )
-
-
-
-    m.fs.brine.eq_reaktoro_properties.outputs.display(
+    # # inspect the inputs and outputs of the reaktoro graybox model
+    # m.fs.evaporator.properties_brine[0].eq_reaktoro_properties.reaktoro_model.inputs.display()
+    #
+    # conversion_dict = m.fs.evaporator.properties_brine[0].eq_reaktoro_properties.rkt_inputs.constraint_dict
+    # for element, species in conversion_dict.items():
+    #     print(element, species)
+    #
+    # m.fs.evaporator.properties_brine[0].eq_reaktoro_properties.reaktoro_model.outputs.display()
+    #
+    # # initialize reaktoro model
+    #
+    # for ion, value in sea_water_composition.items(): #define a dictionary for brine
+    #     """Fix concentration amount"""
+    #     m.fs.evaporator.properties_brine[0].species_concentrations[ion].fix(value) # this is wrong. This needs to be composition in the brine
+    #     set_scaling_factor(m.fs.brine.species_concentrations[ion], 1 / value)
+    #
+    # """Set flow to 1 kg of water"""
+    # m.fs.brine.species_mass_flows["H2O"].fix(1)
+    #
+    # """Initialize concentration constraints """
+    # for comp, pyoobj in m.fs.brine.eq_brine_species_mass_flows.items():
+    #     if "H2O" in comp:
+    #         set_scaling_factor(m.fs.brine.species_mass_flows[ion], 1)
+    #     else:
+    #         calculate_variable_from_constraint(
+    #             m.fs.brine.species_mass_flows[comp], pyoobj
+    #         )
+    #         set_scaling_factor(
+    #             m.fs.brine.species_mass_flows[ion],
+    #             1 / m.fs.brine.species_mass_flows[comp].value,
+    #         )
+    #         constraint_scaling_transform(
+    #             pyoobj, 1 / m.fs.brine.species_mass_flow[comp].value
+    #         )
+    #
+    # m.fs.sea_water.eq_reaktoro_properties.initialize()
+    #
+    # print("Density:",m.fs.brine.density.value)
+    #
+    # print("Solution charge:", m.fs.brine.charge.value)
+    #
+    # m.fs.brine.eq_reaktoro_properties.display_reaktoro_state()
+    #
+    #
+    # # Solve model
+    #
+    # """Unfix Cl and fix charge to 0"""
+    #
+    # m.fs.brine.species_concentrations["Cl"].unfix()
+    # m.fs.brine.charge.fix(0)
+    #
+    # # Check DOF
+    #
+    # print("DOFs:", degrees_of_freedom(m))
+    # outputs_main_block = len(m.fs.brine.eq_reaktoro_properties.reaktoro_model.outputs)
+    # print("Number of Reaktoro outputs", outputs_main_block)
+    # print(
+    #     "Actual DOFs:",
+    #     degrees_of_freedom(m) - (outputs_main_block),
+    # )
+    # assert degrees_of_freedom(m) - (outputs_main_block) == 0
+    #
+    # initial_cl = m.fs.brine.species_concentrations["Cl"].value
+    # cy_solver = get_solver(solver="cyipopt-watertap")
+    #
+    # cy_solver.options["max_iter"] = 25
+    #
+    # result = cy_solver.solve(m, tee=True)
+    # assert_optimal_termination(result)
+    #
+    # print(
+    #     "Density",
+    #     m.fs.brine.density.value,
+    # )
+    #
+    # print(
+    #     "Solution charge",
+    #     m.fs.brine.charge.value,
+    #     "Intial Cl",
+    #     initial_cl,
+    #     "Final Cl",
+    #     m.fs.brine.species_concentrations["Cl"].value,
+    # )
+    #
+    #
+    #
+    # m.fs.brine.eq_reaktoro_properties.outputs.display(
 
 def set_operating_conditions(m):
     # Feed inlet
