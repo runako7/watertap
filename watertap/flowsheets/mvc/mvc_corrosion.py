@@ -854,7 +854,7 @@ def add_scaling_tendencies(m, open_species=False):
     )
     assert degrees_of_freedom(m) - (outputs_main_block) == 0
 
-    # initial_cl = m.fs.evaporator.properties_brine[0].species_concentrations["Cl"].value
+    # run solver
     cy_solver = get_solver(solver="cyipopt-watertap")
 
     cy_solver.options["max_iter"] = 25
@@ -862,7 +862,7 @@ def add_scaling_tendencies(m, open_species=False):
     result = cy_solver.solve(m, tee=True)
     assert_optimal_termination(result)
 
-
+    #dsiplay evaporator brine reaktoro block outputs
     m.fs.evaporator.eq_reaktoro_properties.outputs.display()
 
 def set_operating_conditions(m):
