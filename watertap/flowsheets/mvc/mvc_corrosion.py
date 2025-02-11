@@ -93,18 +93,7 @@ def single_run(material='stainless_steel_316',
     display_metrics(m)
     display_design(m)
 
-    """Temporary place holder"""
-    print("\n***---Fourth solve - optimization with calcite scaling tendency---***")
-    print("DOF after first solve: ", degrees_of_freedom(m))
-    add_scaling_tendencies(m)
-    # m.fs.feed.pH.display() this helps me to check
-
-    assert False  # This will stop the code here
-
-    print("\n***---Second solve - optimization with corrosion rate surrogate---***")
-    add_evap_hx_material_factor_equal_constraint(m)
-    add_corrosion_rate_surrogate(m)
-    set_surrogate_conditions(m,do)
+    print("\n***---Second solve - optimization ---***")
     m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
     del m.fs.objective
     set_up_optimization(m)
@@ -112,7 +101,33 @@ def single_run(material='stainless_steel_316',
     print("Termination condition: ", results.solver.termination_condition)
     display_metrics(m)
     display_design(m)
-    display_corrosion(m)
+
+    print("\n***---Third solve - optimization with calcite scaling tendency---***")
+    print('DOF before adding reaktoro: ', degrees_of_freedom(m))
+    add_scaling_tendencies(m)
+    solve_with_reaktoro(m)
+    m.fs.evaporator.eq_reaktoro_properties.reaktoro_model.outputs.display()
+    display_reaktoro_metrics(m)
+
+    print("\n***---Fourth solve - optimization with bound on calcite scaling tendency---***")
+    setup_optimization_with_reaktoro(m)
+    print('DOF for optimization with reaktoro: ', degrees_of_freedom(m))
+    solve_with_reaktoro(m)
+    display_reaktoro_metrics(m)
+    assert False  # This will stop the code here
+
+    # print("\n***---Second solve - optimization with corrosion rate surrogate---***")
+    # add_evap_hx_material_factor_equal_constraint(m)
+    # add_corrosion_rate_surrogate(m)
+    # set_surrogate_conditions(m,do)
+    # m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
+    # del m.fs.objective
+    # set_up_optimization(m)
+    # results = solve(m, solver=solver, tee=False)
+    # print("Termination condition: ", results.solver.termination_condition)
+    # display_metrics(m)
+    # display_design(m)
+    # display_corrosion(m)
 
     # print("\n***---Third solve - optimization with increased brine temperature upper bound---***")
     # m.fs.evaporator.properties_vapor[0].temperature.setub(95 + 273.15)
@@ -480,6 +495,8 @@ def add_Q_ext(m, time_point=None):
 
 def add_costing(m):
     m.fs.costing = WaterTAPCosting()
+
+
     m.fs.pump_feed.costing = UnitModelCostingBlock(flowsheet_costing_block=m.fs.costing)
     m.fs.pump_distillate.costing = UnitModelCostingBlock(
         flowsheet_costing_block=m.fs.costing
@@ -497,6 +514,17 @@ def add_costing(m):
     m.fs.evaporator.costing = UnitModelCostingBlock(
         flowsheet_costing_block=m.fs.costing
     )
+
+    # cost of acid addition to the evaporator brine
+    acid_cost_per_mol = 5  # $5 per mol of HCl
+    m.fs.evaporator.acid_addition = Var(initialize=0.00001, units=pyunits.mol / pyunits.s)
+    m.fs.evaporator.costing.acid_addition_cost = Var(
+        initialize=acid_cost_per_mol * m.fs.evaporator.acid_addition / m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq', 'H2O']
+                   * m.fs.feed.properties[0].dens_mass_phase["Liq"], units=pyo.units.USD_2020 / pyunits.m**3
+    )
+
+
+
     m.fs.compressor.costing = UnitModelCostingBlock(
         flowsheet_costing_block=m.fs.costing
     )
@@ -535,9 +563,14 @@ def add_costing(m):
     m.fs.costing.MVC_capital_cost_percentage["compressor"] = (
             m.fs.compressor.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
 
-    # Percentage of costs normalized to LCOW
+    # # Percentage of costs normalized to LCOW
+    # m.fs.costing.annual_operating_costs = Expression(
+    #     expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost)
+
+    # Percentage of costs normalized to LCOW (with acid addition)
     m.fs.costing.annual_operating_costs = Expression(
-        expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost)
+        expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost) # + m.fs.evaporator.costing.acid_addition_cost)
+
     m.fs.costing.MVC_LCOW_comp = Set(initialize=["feed_pump",
                                                  "distillate_pump",
                                                  "brine_pump",
@@ -587,51 +620,38 @@ def add_evap_hx_material_factor_equal_constraint(m):
         expr=m.fs.costing.heat_exchanger.material_factor_cost == m.fs.costing.evaporator.material_factor_cost)
     # m.fs.costing.heat_exchanger.material_factor_cost = m.fs.costing.evaporator.material_factor_cost.value
 
-def add_scaling_tendencies(m, open_species=False):
+def add_scaling_tendencies(m):
     # define sea water composition concentration in mg/l and pH
     sea_water_composition = {
         "Na": 10556,
         "K": 380,
         "Ca": 400,
         "Mg": 1262,
-        "Cl": 17000,  # this is lower then typical to emulate a feed that was not charge balanced
+        "Cl": 18980,
         "SO4": 2649,
         "HCO3": 140,
     }
     sea_water_pH = 7.56
 
-    """ Initialize pH, species concentrations, species mass flows, charge of raw feed """
-
-    # fix pH of raw feed (raw --> no acid addition)
-    m.fs.feed.pH = Var(initialize=sea_water_pH)
-    m.fs.feed.pH.fix()
-    set_scaling_factor(m.fs.feed.pH, 1)
-
-    # initialize ion concentrations in raw feed
+    """Feed concentration, species mass flow, and pH variables"""
+    # Variable (7 because 7 ions): feed species concentration
     ions = list(sea_water_composition.keys())
     m.fs.feed.species_concentrations = Var(
         ions,
         initialize=1,
         units=pyunits.mg / pyunits.L,
     )
-
-    # initialize mass flow of all the species in the raw feed, including water
+    # Variable (8 = 7 ions + 1 H2O): feed species mass flows
     ions.append("H2O")
     m.fs.feed.species_mass_flows = Var(
         ions,
         initialize=1,
         units=pyunits.kg/pyunits.s
     )
+    # Variable (1): pH of raw feed (raw --> no acid addition)
+    m.fs.feed.pH = Var(initialize=sea_water_pH)
 
-    # # initialize charge neutrality in the raw feed
-    # m.fs.feed.charge = Var(initialize=0)
-    # set_scaling_factor(m.fs.feed.charge, 1e8)
-
-    # Here is the density of the feed: print(m.fs.feed.properties[0].dens_mass_phase["Liq"].value)
-
-
-    # Constraint 1 for species concentrations in raw feed with no acid addition
-
+    # Constraint (1): feed TDS is equal to the sum of species mass flow
     m.fs.eq_feed_TDS_constraint = Constraint(
         expr = m.fs.feed.properties[0].flow_mass_phase_comp["Liq", "TDS"] == sum(
             m.fs.feed.species_mass_flows[ion]
@@ -640,10 +660,12 @@ def add_scaling_tendencies(m, open_species=False):
         )
     )
 
-    # Constraint 2 to convert raw feed concentrations to mass flows (need to eventually use the Reaktoro generated density???)
+    # Constraint (1): connect feed species mass flow of H2O to feed H2O flow rate
+    m.fs.eq_feed_H2O_constraint = Constraint(
+        expr=m.fs.feed.species_mass_flows['H2O'] == m.fs.feed.properties[0].flow_mass_phase_comp["Liq", "H2O"]
+    )
 
-    # added 1e-3 to account for units
-
+    # Constraint (7): 2 to convert feed concentrations to mass flows (based on seawater prop package density)
     @m.fs.feed.Constraint(list(m.fs.feed.species_concentrations.keys()))
     def eq_feed_species_mass_flows(fs, ion):
         #calculate mass flow based on density
@@ -654,216 +676,150 @@ def add_scaling_tendencies(m, open_species=False):
             to_units=pyunits.kg / pyunits.s,
         )
 
-    """ Initialize scaling tendencies, pH, density, species concentrations, species mass flows, and charge of evaporator brine """
-
-    # initialize Calcite scaling tendency in evaporator brine
-    m.fs.evaporator.properties_brine[0].scaling_tendencies = Var(
-        [
-            ("scalingTendency", "Calcite"),
-        ],
-        initialize=1,
-    )
-    # initialize evaporator brine pH
-    evaporator_brine_pH = sea_water_pH
-    m.fs.evaporator.properties_brine[0].pH = Var(initialize=evaporator_brine_pH)
-    set_scaling_factor(m.fs.evaporator.properties_brine[0].pH, 1)
-
-    #initialize evaporator brine density
-    m.fs.evaporator.properties_brine[0].density = Var(initialize=1000, units=pyunits.kg / pyunits.m**3)
-    set_scaling_factor(m.fs.evaporator.properties_brine[0].density, 1e3)
-    # evaporator brine charge
-    m.fs.evaporator.properties_brine[0].charge = Var(initialize=0)
-    set_scaling_factor(m.fs.evaporator.properties_brine[0].charge, 1e8)
-
-
-    # initialize evaporator brine species concentrations, excluding water
-    m.fs.evaporator.properties_brine[0].species_concentrations = Var(
-        list(sea_water_composition.keys()),
-        initialize=1,
-        units=pyunits.mg / pyunits.L,
-    )
-
-    # initialize evaporator brine species mass flows, including water
-    m.fs.evaporator.properties_brine[0].species_mass_flows = Var(
+    """Evaporator brine species mass flow, pH, and acid addition"""
+    # Variable (8): brine species mass flows
+    m.fs.evaporator.brine_species_mass_flows = Var(
         ions,
         initialize=1,
         units=pyunits.kg / pyunits.s
     )
 
+    # Variable (1): brine pH
+    m.fs.evaporator.brine_pH = Var(initialize=1,units=pyunits.dimensionless)
+    m.fs.evaporator.brine_pH.setlb(4)
+    # Variable (1): acid addition - removed from here since I add it to the add_costing function
+    # m.fs.evaporator.acid_addition = Var(initialize=0.00001, units=pyunits.mol / pyunits.s)
 
-    # Constraint 9 for species concentrations in evaporator brine with no acid addition
-    m.fs.eq_evaporator_brine_TDS_constraint = Constraint(
-        expr=m.fs.evaporator.properties_brine[0].flow_mass_phase_comp["Liq", "TDS"] == sum(
-            m.fs.evaporator.properties_brine[0].species_mass_flows[ion]
-            for ion in ions
-            if ion != "H2O"
-        )
+    # Constraint (8): brine species mass flows
+    @m.fs.evaporator.Constraint(list(m.fs.evaporator.brine_species_mass_flows.keys()))
+    def eq_feed_to_brine_mass_flows(fs, ion):
+        if ion == 'H2O':
+            return m.fs.evaporator.brine_species_mass_flows[ion] == m.fs.evaporator.properties_brine[0].flow_mass_phase_comp['Liq', 'H2O']
+        else: # species mass balance
+            return m.fs.evaporator.brine_species_mass_flows[ion] == m.fs.feed.species_mass_flows[ion]
+
+    # Variable (1): calcite scaling tendency in brine
+    m.fs.evaporator.brine_scaling_tendencies = Var(
+        [
+            ("scalingTendency", "Calcite"),
+        ],
+        initialize=1,
     )
-
-    #  Constraint 10 to convert evaporator brine concentrations to mass flows (need to use the Reaktoro generated density)
-
-    # added 1e-3 to account for units
-
-    @m.fs.evaporator.properties_brine[0].Constraint(list(m.fs.evaporator.properties_brine[0].species_concentrations.keys()))
-    def eq_evaporator_brine_species_mass_flows(fs, ion):
-        # calculate mass flow based on density
-        return m.fs.evaporator.properties_brine[0].species_mass_flows[ion] == pyunits.convert(
-            m.fs.evaporator.properties_brine[0].species_concentrations[ion]
-            * m.fs.evaporator.properties_brine[0].species_mass_flows["H2O"]
-            / m.fs.evaporator.properties_brine[0].density,
-            to_units=pyunits.kg / pyunits.s,
-        )
-
-    @m.fs.evaporator.properties_brine[0].Constraint(list(m.fs.evaporator.properties_brine[0].species_concentrations.keys()))
-    def eq_feed_to_evaporator_brine_mass_flows(fs, ion):
-        return m.fs.evaporator.properties_brine[0].species_mass_flows[ion] == m.fs.feed.species_mass_flows[ion]
-
-
-
-    ####### 16 Constraints added so far #######
-
+    print('DOF after RKT variable added but not RKT block: ', degrees_of_freedom(m))
     """ Build reaktoro output dictionary for the scaling tendency of the evaporator brine """
-
     # add evaporator brine scaling tendencies
     m.fs.evaporator.reaktoro_output_properties = {}
-    for key, obj in  m.fs.evaporator.properties_brine[0].scaling_tendencies.items():
+    for key, obj in m.fs.evaporator.brine_scaling_tendencies.items():
         m.fs.evaporator.reaktoro_output_properties[key] = obj
     # add evaporator brine pH
-    m.fs.evaporator.reaktoro_output_properties[("pH", None)] = m.fs.evaporator.properties_brine[0].pH
-    # add evaporator brine density
-    m.fs.evaporator.reaktoro_output_properties[("density", None)] = m.fs.evaporator.properties_brine[0].density
-    # add evaporator brine charge
-    m.fs.evaporator.reaktoro_output_properties[("charge", None)] = m.fs.evaporator.properties_brine[0].charge
-    # set speciesAmount to True
-    m.fs.evaporator.reaktoro_output_properties["speciesAmount"] = True
+    m.fs.evaporator.reaktoro_output_properties[("pH", None)] = m.fs.evaporator.brine_pH
 
-    #
-    # if open_species:
-    #
-    #     # Example for opening additional species to improve
-    #     # reaktoro solver stability,
-    #     # Note how this does not alter reaktoro output results as
-    #     # the H+ and OH- is already constrained by total H amount in property
-    #     # block, as such the DOFs are still zero.
-    #
-    #     # However, this can result in incorrect speciation for some databases, so please use with caution.
-    #
-    #     species_to_open = ["H+", "OH-"]
-    # else:
-    #     species_to_open = None
-    #
-
-
-    """ Configure evaporator reaktoro block """
-
+    """ Configure brine properties reaktoro block """
     m.fs.evaporator.eq_reaktoro_properties = ReaktoroBlock(
         system_state={
             "temperature":m.fs.evaporator.properties_brine[0].temperature,
             "pressure":m.fs.evaporator.properties_brine[0].pressure,
-            "pH": m.fs.evaporator.properties_brine[0].pH,
+            "pH": m.fs.feed.pH,
         },
         aqueous_phase={
-            "composition":m.fs.evaporator.properties_brine[0].species_mass_flows, # should be based on brine in the evaporator
+            "composition":m.fs.evaporator.brine_species_mass_flows, # should be based on brine in the evaporator
             "convert_to_rkt_species": True,
             # We can use default converter as its defined for default database (Phreeqc and pitzer)
             "activity_model": reaktoro.ActivityModelPitzer(),  # Can provide a string, or Reaktoro initialized class
-            "fixed_solvent_specie": "H2O",  # We need to define our aqueous solvent as we have to speciate the block
+            # "fixed_solvent_specie": "H2O",  # We need to define our aqueous solvent as we have to speciate the block
         },
-        outputs=m.fs.evaporator.reaktoro_output_properties,# outputs we desired
+        outputs=m.fs.evaporator.reaktoro_output_properties, # outputs we desired
+        chemistry_modifier={"HCl": m.fs.evaporator.acid_addition},
+        build_speciation_block=True,
         database="PhreeqcDatabase",  # can also be reaktoro.PhreeqcDatabase('pitzer.dat')
         database_file="pitzer.dat",  # needs to be a string that names the database file or points to its location
         dissolve_species_in_reaktoro=True,  # This will sum up all species into elements in Reaktoro directly, if set to false, it will build Pyomo constraints instead
-        assert_charge_neutrality=False,  # This is True by Default, but here we actually want to adjust the input speciation till the charge is zero
+        # assert_charge_neutrality=False,  # This is True by Default, but here we actually want to adjust the input speciation till the charge is zero
     )
 
-    # inspect the inputs and outputs of the reaktoro graybox model
-    m.fs.evaporator.eq_reaktoro_properties.reaktoro_model.inputs.display()
+    """Fix and unfix variables and scaling of variables and constraints"""
+    #Unfix feed mass fraction of feed
+    m.fs.feed.properties[0].mass_frac_phase_comp['Liq', 'TDS'].unfix()
+    # Fix and scale feed pH (1 variable fixed)
+    m.fs.feed.pH.fix()
+    set_scaling_factor(m.fs.feed.pH, 1)
 
-    conversion_dict = m.fs.evaporator.eq_reaktoro_properties.rkt_inputs.constraint_dict
-    for element, species in conversion_dict.items():
-        print(element, species)
-
-    m.fs.evaporator.eq_reaktoro_properties.reaktoro_model.outputs.display()
-
-    ####### 34 variables added to far (1 fixed) #######
-
-    """ Initialize evaporator reaktoro model"""
-
-    # fix concentrations for species in raw feed
+    # Fix and scale feed species concentrations (7 variables fixed)
     for ion, value in sea_water_composition.items():
         m.fs.feed.species_concentrations[ion].fix(value)
         set_scaling_factor(m.fs.feed.species_concentrations[ion], 1 / value)
 
+    # Fix pH first
+    # m.fs.evaporator.brine_pH.fix(6.8)
+    set_scaling_factor(m.fs.evaporator.brine_pH, 1)
+    # Scale acid addition
+    m.fs.evaporator.acid_addition.fix()
+    set_scaling_factor(m.fs.evaporator.acid_addition, 1 / 0.001)
 
-    # fix mass flow of H2O to 1 kg/s in both the raw feed and the evaporator
-    m.fs.feed.species_mass_flows["H2O"].fix(40)
-
-    # initialize concentration constraints for raw feed
+    """Initialization"""
+    # initialize mass flow constraints for raw feed
     for comp, pyoobj in m.fs.feed.eq_feed_species_mass_flows.items():
-        if "H2O" in comp:
-            set_scaling_factor(m.fs.feed.species_mass_flows[comp], 1)
-        else:
-            calculate_variable_from_constraint(
-                m.fs.feed.species_mass_flows[comp], pyoobj
-            )
-            set_scaling_factor(
-                m.fs.feed.species_mass_flows[comp],
-                1 / m.fs.feed.species_mass_flows[comp].value,
-            )
-            constraint_scaling_transform(
-                pyoobj, 1 / m.fs.feed.species_mass_flows[comp].value
-            )
+        calculate_variable_from_constraint(
+            m.fs.feed.species_mass_flows[comp], pyoobj
+        )
+        set_scaling_factor(
+            m.fs.feed.species_mass_flows[comp],
+            1 / m.fs.feed.species_mass_flows[comp].value,
+        )
+        constraint_scaling_transform(
+            pyoobj, 1 / m.fs.feed.species_mass_flows[comp].value
+        )
+    # Initialize water flow constraints for feed
+    set_scaling_factor(m.fs.feed.species_mass_flows["H2O"], 1)
+    m.fs.feed.species_mass_flows['H2O'] = m.fs.feed.properties[0].flow_mass_phase_comp['Liq', 'H2O']
 
     # initialize concentration constraints for evaporator brine
-    for comp, pyoobj in m.fs.evaporator.properties_brine[0].eq_evaporator_brine_species_mass_flows.items():
+    for comp, pyoobj in m.fs.evaporator.eq_feed_to_brine_mass_flows.items():
         if "H2O" in comp:
-            set_scaling_factor(m.fs.evaporator.properties_brine[0].species_mass_flows[comp], 1)
+            set_scaling_factor(m.fs.evaporator.brine_species_mass_flows[comp], 1)
+            calculate_variable_from_constraint(
+                m.fs.evaporator.brine_species_mass_flows[comp], pyoobj
+            )
         else:
             calculate_variable_from_constraint(
-                m.fs.evaporator.properties_brine[0].species_mass_flows[comp], pyoobj
+                m.fs.evaporator.brine_species_mass_flows[comp], pyoobj
             )
             set_scaling_factor(
-                m.fs.evaporator.properties_brine[0].species_mass_flows[comp],
-                1 / m.fs.evaporator.properties_brine[0].species_mass_flows[comp].value,
+                m.fs.evaporator.brine_species_mass_flows[comp],
+                1 / m.fs.evaporator.brine_species_mass_flows[comp].value,
             )
             constraint_scaling_transform(
-                pyoobj, 1 / m.fs.evaporator.properties_brine[0].species_mass_flows[comp].value
+                pyoobj, 1 / m.fs.evaporator.brine_species_mass_flows[comp].value
             )
 
     # initialize evaporator reaktoro block
     m.fs.evaporator.eq_reaktoro_properties.initialize()
 
-    print("Density:",m.fs.evaporator.properties_brine[0].density.value)
-
-    print("Solution charge:", m.fs.evaporator.properties_brine[0].charge.value)
-
-    m.fs.evaporator.eq_reaktoro_properties.display_reaktoro_state()
-
-    ####### 34 variables added so far (9 fixed) ######
-
-    """ Solve evaporator reaktoro model """
-
     # Check DOF
-
-    print("DOFs:", degrees_of_freedom(m))
+    print("DOFs:", degrees_of_freedom(m)) # DOF is going to be 4 + 2 because we already ran optimization
     outputs_main_block = len(m.fs.evaporator.eq_reaktoro_properties.reaktoro_model.outputs)
     print("Number of Reaktoro outputs", outputs_main_block)
     print(
         "Actual DOFs:",
         degrees_of_freedom(m) - (outputs_main_block),
     )
-    assert degrees_of_freedom(m) - (outputs_main_block) == 0
+    # assert degrees_of_freedom(m) - (outputs_main_block) == 0
 
+def solve_with_reaktoro(m, solver=None):
     # run solver
-    cy_solver = get_solver(solver="cyipopt-watertap")
+    if solver is None:
+        solver = get_solver(solver="cyipopt-watertap")
+        solver.options["max_iter"] = 100
 
-    cy_solver.options["max_iter"] = 25
-
-    result = cy_solver.solve(m, tee=True)
+    result = solver.solve(m, tee=True)
     assert_optimal_termination(result)
 
     #dsiplay evaporator brine reaktoro block outputs
-    m.fs.evaporator.eq_reaktoro_properties.outputs.display()
+    # m.fs.evaporator.eq_reaktoro_properties.outputs.display()
+
+def setup_optimization_with_reaktoro(m, solver=None):
+    m.fs.evaporator.reaktoro_output_properties[("scalingTendency", "Calcite")].setub(1)
+    m.fs.evaporator.acid_addition.unfix()
 
 def set_operating_conditions(m):
     # Feed inlet
@@ -1131,6 +1087,7 @@ def scale_costs(m):
     calculate_cost_sf(m.fs.costing.aggregate_flow_costs["electricity"])
     calculate_cost_sf(m.fs.costing.total_capital_cost)
     calculate_cost_sf(m.fs.costing.total_operating_cost)
+    # calculate_cost_sf(m.fs.evaporator.costing.acid_addition_cost) # acid addition pretreatment
 
     iscale.calculate_scaling_factors(m)
 
@@ -1274,6 +1231,11 @@ def display_scaling_tendencies(m):
         print(f"{key}, {obj.value}")
 
 
+def display_reaktoro_metrics(m):
+    print('Feed pH: ', m.fs.feed.pH.value)
+    print('Brine pH: ', m.fs.evaporator.brine_pH.value)
+    print('Acid addition: ', m.fs.evaporator.acid_addition.value)
+    print('Calcite scaling tendency: ', m.fs.evaporator.brine_scaling_tendencies[('scalingTendency', 'Calcite')].value)
 def feed_salinity_recovery_sweep(material='stainless_steel_316',
                                  do=0):
     save_dir = "C:/Users/Carson/idaes/NAWI-analysis/analysis_waterTAP/analysisWaterTAP/analysis_scripts/mvc_corrosion/results"
