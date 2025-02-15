@@ -22,6 +22,8 @@ from pyomo.environ import (
     units as pyunits,
     check_optimal_termination,
     assert_optimal_termination,
+    Block,
+    Param
 )
 from pyomo.network import Arc, SequentialDecomposition
 
@@ -79,7 +81,9 @@ def single_run(material='stainless_steel_316',
     # rescale costs after initialization because scaling depends on flow rates
     scale_costs(m)
     fix_outlet_pressures(m)  # outlet pressure are initially unfixed for initialization
-
+    m.fs.pretreatment.acid_addition["HCl"].fix(0)
+    # print(dir(m.fs.costing))
+    # assert False
     # set up for minimizing Q_ext in first solve
     # should be 1 DOF because Q_ext is unfixed
     print("DOF after initialization: ", degrees_of_freedom(m))
@@ -104,6 +108,7 @@ def single_run(material='stainless_steel_316',
 
     print("\n***---Third solve - optimization with calcite scaling tendency---***")
     print('DOF before adding reaktoro: ', degrees_of_freedom(m))
+    m.fs.pretreatment.acid_addition["HCl"].unfix()
     add_scaling_tendencies(m)
     solve_with_reaktoro(m)
     m.fs.evaporator.eq_reaktoro_properties.reaktoro_model.outputs.display()
@@ -515,17 +520,24 @@ def add_costing(m):
         flowsheet_costing_block=m.fs.costing
     )
 
+    # Pretreatment block
+    m.fs.pretreatment = Block()
     # Initialize acid addition flow - removed from add_scaling_tendency function
-    m.fs.acid_addition = Var(initialize=0.00001, units=pyunits.mol / pyunits.s)
-    # Define parameter for HCl cost
-	blk.HCl_cost = Param(initialize=0.13, units=m.fs.costing.base_currency/pyunits.kg, mutable=True)
-    # Define expression for flow of HCl
-    blk.flow_HCl = Expression(expr=pyunits.convert(m.fs.acid_addition, to_units=pyunits.kg/pyunits.s))
-    # Register the flow in the costing block
-    m.fs.costing.register_flow_type(blk.acid_addition + ".HCl", blk.HCl_cost)
-    # Cost_flow method on the costing block
-	m.fs.costing.cost_flow(blk.flow_HCl, blk.acid_addition + ".HCl")
+    m.fs.pretreatment.acid_addition = Var(["HCl"], initialize=0.00001, units=pyunits.mol / pyunits.s)
+    #m.fs.pretreatment.acid_addition.display()
 
+    # Define parameter for HCl cost
+    m.fs.pretreatment.HCl_cost = Param(initialize=4.7e-3, units=m.fs.costing.base_currency/pyunits.mol, mutable=True)
+    # Define expression for flow of HCl
+    # m.fs.pretreatment.flow_HCl = Expression(expr=pyunits.convert(m.fs.pretreatment.acid_addition, to_units=pyunits.kg/pyunits.s)) # check unit conversion
+    # m.fs.pretreatment.flow_HCl = Expression(
+    #     expr=m.fs.pretreatment.acid_addition["HCl"])
+    m.fs.pretreatment.flow_HCl = Expression(
+        expr=pyunits.convert(m.fs.pretreatment.acid_addition["HCl"], to_units=pyunits.mol / pyunits.s))
+    # Register the flow in the costing block
+    m.fs.costing.register_flow_type("HCl", m.fs.pretreatment.HCl_cost)
+    # Cost_flow method on the costing block
+    m.fs.costing.cost_flow(m.fs.pretreatment.flow_HCl, "HCl")
 
 
     m.fs.compressor.costing = UnitModelCostingBlock(
@@ -537,6 +549,8 @@ def add_costing(m):
     m.fs.costing.add_LCOW(m.fs.distillate.properties[0].flow_vol)
     m.fs.costing.add_specific_energy_consumption(m.fs.distillate.properties[0].flow_vol)
     m.fs.costing.base_currency = pyo.units.USD_2020
+
+    # m.fs.costing.display()
 
     # Add costing expressions
     m.fs.costing.MVC_components = Set(initialize=["feed_pump",
@@ -566,13 +580,11 @@ def add_costing(m):
     m.fs.costing.MVC_capital_cost_percentage["compressor"] = (
             m.fs.compressor.costing.capital_cost / m.fs.costing.aggregate_capital_cost)
 
-    # # Percentage of costs normalized to LCOW
-    # m.fs.costing.annual_operating_costs = Expression(
-    #     expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost)
-
-    # Percentage of costs normalized to LCOW (with acid addition)
+    # Percentage of costs normalized to LCOW
     m.fs.costing.annual_operating_costs = Expression(
         expr=m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor + m.fs.costing.total_operating_cost)
+
+
 
     m.fs.costing.MVC_LCOW_comp = Set(initialize=["feed_pump",
                                                  "distillate_pump",
@@ -586,8 +598,8 @@ def add_costing(m):
                                                  "MLC",
                                                  "capital_costs",
                                                  "operating_costs",
-                                                 "capex_opex_ratio"
-                                                 "acid_addition"]) # included acid addition
+                                                 "capex_opex_ratio",
+                                                 "pretreatment"]) # included acid addition
     m.fs.costing.LCOW_percentage = Expression(m.fs.costing.MVC_LCOW_comp)
     m.fs.costing.LCOW_percentage["feed_pump"] = (
             m.fs.pump_feed.costing.capital_cost * m.fs.costing.total_investment_factor * m.fs.costing.capital_recovery_factor / m.fs.costing.annual_operating_costs)
@@ -617,9 +629,8 @@ def add_costing(m):
             m.fs.costing.total_capital_cost * m.fs.costing.capital_recovery_factor / m.fs.costing.total_operating_cost)
 
     # Add acid cost to cost breakdown expressions
-    m.fs.costing.LCOW_percentage['acid_addition'] = (
-        m.fs.costing.acid_addition /  m.fs.costing.annual_operating_costs
-    )
+    m.fs.costing.LCOW_percentage['pretreatment'] = (m.fs.costing.aggregate_flow_costs[
+                                                       'HCl'] * m.fs.costing.utilization_factor / m.fs.costing.annual_operating_costs)
 
 
 def add_evap_hx_material_factor_equal_constraint(m):
@@ -697,7 +708,7 @@ def add_scaling_tendencies(m):
     m.fs.evaporator.brine_pH = Var(initialize=1,units=pyunits.dimensionless)
     m.fs.evaporator.brine_pH.setlb(4)
     # Variable (1): acid addition - removed from here since I add it to the add_costing function
-    # m.fs.acid_addition = Var(initialize=0.00001, units=pyunits.mol / pyunits.s)
+    # m.fs.pretreatment.acid_addition = Var(initialize=0.00001, units=pyunits.mol / pyunits.s)
 
     # Constraint (8): brine species mass flows
     @m.fs.evaporator.Constraint(list(m.fs.evaporator.brine_species_mass_flows.keys()))
@@ -738,7 +749,7 @@ def add_scaling_tendencies(m):
             # "fixed_solvent_specie": "H2O",  # We need to define our aqueous solvent as we have to speciate the block
         },
         outputs=m.fs.evaporator.reaktoro_output_properties, # outputs we desired
-        chemistry_modifier={"HCl": m.fs.acid_addition},
+        chemistry_modifier={"HCl": m.fs.pretreatment.acid_addition["HCl"]},
         build_speciation_block=True,
         database="PhreeqcDatabase",  # can also be reaktoro.PhreeqcDatabase('pitzer.dat')
         database_file="pitzer.dat",  # needs to be a string that names the database file or points to its location
@@ -762,8 +773,8 @@ def add_scaling_tendencies(m):
     # m.fs.evaporator.brine_pH.fix(6.8)
     set_scaling_factor(m.fs.evaporator.brine_pH, 1)
     # Scale acid addition
-    m.fs.acid_addition.fix()
-    set_scaling_factor(m.fs.acid_addition, 1 / 0.001)
+    m.fs.pretreatment.acid_addition["HCl"].fix()
+    set_scaling_factor(m.fs.pretreatment.acid_addition["HCl"], 1 / 0.001)
 
     """Initialization"""
     # initialize mass flow constraints for raw feed
@@ -828,7 +839,7 @@ def solve_with_reaktoro(m, solver=None):
 
 def setup_optimization_with_reaktoro(m, solver=None):
     m.fs.evaporator.reaktoro_output_properties[("scalingTendency", "Calcite")].setub(1)
-    m.fs.acid_addition.unfix()
+    m.fs.pretreatment.acid_addition["HCl"].unfix()
 
 def set_operating_conditions(m):
     # Feed inlet
@@ -1243,7 +1254,7 @@ def display_scaling_tendencies(m):
 def display_reaktoro_metrics(m):
     print('Feed pH: ', m.fs.feed.pH.value)
     print('Brine pH: ', m.fs.evaporator.brine_pH.value)
-    print('Acid addition: ', m.fs.acid_addition.value)
+    print('Acid addition: ', m.fs.pretreatment.acid_addition["HCl"].value)
     print('Calcite scaling tendency: ', m.fs.evaporator.brine_scaling_tendencies[('scalingTendency', 'Calcite')].value)
 def feed_salinity_recovery_sweep(material='stainless_steel_316',
                                  do=0):
