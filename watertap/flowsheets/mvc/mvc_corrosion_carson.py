@@ -656,7 +656,6 @@ def add_scaling_tendencies(m):
     kg_to_g = 0.001
     total_species_concentration_g_per_g = total_species_concentrations_mg_per_l * l_to_m3 * g_to_mg / H20_density * kg_to_g
     case_concentration = 0.075
-    # concentration_factor = case_concentration / total_species_concentrations_g_per_g # Make this a variable and write it as a constraint
 
     m.fs.feed.concentration_factor = Var(initialize = case_concentration / total_species_concentration_g_per_g)
 
