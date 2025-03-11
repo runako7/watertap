@@ -99,7 +99,7 @@ def single_run(material='stainless_steel_316',
 
     print("\n***---Second solve - optimization ---***")
     m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
-    m.fs.recovery.fix(0.7)
+    #m.fs.recovery.fix(0.7)
 
     del m.fs.objective
     set_up_optimization(m)
@@ -107,6 +107,17 @@ def single_run(material='stainless_steel_316',
     print("Termination condition: ", results.solver.termination_condition)
     display_metrics(m)
     display_design(m)
+
+    print("\n***---5th solve - optimization with corrosion rate surrogate---***")
+    add_evap_hx_material_factor_equal_constraint(m)
+    add_corrosion_rate_surrogate(m)
+    set_surrogate_conditions(m, do)
+    set_up_optimization(m)
+    results = solve(m, solver=solver, tee=False)
+    print("Termination condition: ", results.solver.termination_condition)
+    display_metrics(m)
+    display_design(m)
+    display_corrosion(m)
 
     print("\n***---Third solve - optimization with calcite scaling tendency---***")
     print('DOF before adding reaktoro: ', degrees_of_freedom(m))
@@ -120,23 +131,14 @@ def single_run(material='stainless_steel_316',
     print("\n***---Fourth solve - optimization with bound on calcite scaling tendency---***")
     setup_optimization_with_reaktoro(m)
     print('DOF for optimization with reaktoro: ', degrees_of_freedom(m))
-    solve_with_reaktoro(m)
+    results = solve_with_reaktoro(m)
     display_reaktoro_metrics(m)
     display_metrics(m)
-    assert False  # This will stop the code here
 
-    print("\n***---Nth solve - optimization with corrosion rate surrogate---***")
-    add_evap_hx_material_factor_equal_constraint(m)
-    add_corrosion_rate_surrogate(m)
-    set_surrogate_conditions(m,do)
-    m.fs.Q_ext[0].fix(0)  # no longer want external heating in evaporator
-    del m.fs.objective
-    set_up_optimization(m)
-    results = solve(m, solver=solver, tee=False)
-    print("Termination condition: ", results.solver.termination_condition)
-    display_metrics(m)
-    display_design(m)
-    display_corrosion(m)
+    save_RG_analysis(m, results, material='stainless_steel_316', do=0)
+    print('Save complete')
+
+
 
     # print("\n***---Third solve - optimization with increased brine temperature upper bound---***")
     # m.fs.evaporator.properties_vapor[0].temperature.setub(95 + 273.15)
@@ -850,7 +852,7 @@ def solve_with_reaktoro(m, solver=None):
 
     result = solver.solve(m, tee=True)
     assert_optimal_termination(result)
-
+    return result
     #dsiplay evaporator brine reaktoro block outputs
     # m.fs.evaporator.eq_reaktoro_properties.outputs.display()
 
@@ -1274,6 +1276,7 @@ def display_reaktoro_metrics(m):
     print('Brine pH: ', m.fs.evaporator.brine_pH.value)
     print('Acid addition: ', m.fs.pretreatment.acid_addition["HCl"].value)
     print('Calcite scaling tendency: ', m.fs.evaporator.brine_scaling_tendencies[('scalingTendency', 'Calcite')].value)
+
 def feed_salinity_recovery_sweep(material='stainless_steel_316',
                                  do=0):
     save_dir = "C:/Users/Carson/idaes/NAWI-analysis/analysis_waterTAP/analysisWaterTAP/analysis_scripts/mvc_corrosion/results"
@@ -1360,6 +1363,50 @@ def feed_salinity_recovery_sweep(material='stainless_steel_316',
 
     return
 
+def save_RG_analysis(m, results, material='stainless_steel_316',
+                                 do=0):
+    save_dir = "C:/Users/runak/Documents/Stanford/WE3/WaterTAP/watertap/watertap/flowsheets/mvc/results"
+    filename = save_dir + f"/{material}_{do}_feed_recovery.csv"
+
+    salinity_recovery_dict = {}
+    salinity_recovery_dict[75] = [0.5, 0.7]
+    salinity_recovery_dict[100] = [0.5]
+    results_dict = build_results_dict()
+
+    for sal, rec in salinity_recovery_dict.items():
+        # start at first recovery
+        m.fs.recovery[0].fix(rec[0])
+
+        m.fs.feed.properties[0].mass_frac_phase_comp["Liq", "TDS"].fix(sal/1000)
+        #results = solve(m)
+        print('Next salinity termination condition:', results.solver.termination_condition)
+        for r in rec:
+            m.fs.recovery[0].fix(r)
+            try:
+                #results = solve(m)
+                results_dict['Termination condition'].append(results.solver.termination_condition)
+                update_results_dict(m, results_dict)
+            except:
+                results_dict['Feed salinity'].append(sal)
+                results_dict['Recovery'].append(r)
+                results_dict['Material'].append(material)
+                results_dict['Termination condition'].append('bad status')
+                update_results_dict_error(results_dict)
+
+        # temporarily save results
+        results_df = pd.DataFrame(results_dict)
+        results_df.to_csv(filename, index=False)
+
+    # save results as dataframe
+    results_df = pd.DataFrame(results_dict)
+    results_df.to_csv(filename, index=False)
+    print(f'Saved {material} and {do} dissolved oxygen')
+
+    return
+
+
+
+
 def build_results_dict():
     res_dict = {}
     res_dict['Feed salinity'] = []
@@ -1386,6 +1433,10 @@ def build_results_dict():
     res_dict['Dissolved oxygen']= []
     res_dict['capex_opex_ratio'] = []
     res_dict['Termination condition'] = []
+    res_dict['Feed pH'] = []
+    res_dict['Brine pH'] = []
+    res_dict['Acid addition'] = []
+    res_dict['Calcite scaling tendency'] = []
 
     return res_dict
 
@@ -1414,6 +1465,10 @@ def update_results_dict(m, res_dict):
     res_dict['Potential difference'].append(m.fs.potential_difference.value)
     res_dict['Dissolved oxygen'].append(m.fs.dissolved_oxygen_index[0].value)
     res_dict['capex_opex_ratio'].append(value(m.fs.costing.LCOW_percentage['capex_opex_ratio']))
+    res_dict['Feed pH'].append(m.fs.feed.pH.value)
+    res_dict['Brine pH'].append(m.fs.evaporator.brine_pH.value)
+    res_dict['Acid addition'].append(m.fs.pretreatment.acid_addition["HCl"].value)
+    res_dict['Calcite scaling tendency'].append(m.fs.evaporator.brine_scaling_tendencies[('scalingTendency', 'Calcite')].value)
 
     return res_dict
 
@@ -1438,6 +1493,10 @@ def update_results_dict_error(res_dict):
     res_dict['Potential difference'].append(np.NAN)
     res_dict['Dissolved oxygen'].append(np.NAN)
     res_dict['capex_opex_ratio'].append(np.NAN)
+    res_dict['Feed pH'].append(np.NAN)
+    res_dict['Brine pH'].append(np.NAN)
+    res_dict['Acid addition'].append(np.NAN)
+    res_dict['Calcite scaling tendency'].append(np.NAN)
 
     return res_dict
 
@@ -1454,6 +1513,7 @@ if __name__ == "__main__":
         ]
     do_list = [0, 3.5, 7]
     single_run(material='stainless_steel_316', do=0)
+
     # for mat in mat_list:
     #     for do in do_list:
     #         feed_salinity_recovery_sweep(mat, do)
